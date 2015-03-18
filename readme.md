@@ -9,13 +9,13 @@ Usage
 
 Start TartWM with this at the end of your .xinitrc
 
-    exec tartwm
+    exec tartwm <path/to/config
 
 
 Configuration
 ---
 
-TartWM will read a config file from `~/.config/tartwm`. Here's an example:
+TartWM will read a config file from stdin. Here's an example:
 
     x 5
     y 6 
@@ -80,19 +80,24 @@ Toggles anchoring of the active (or specified) window. Anchored windows can't be
 or crushed during moves/resizing.
 
 
-Filling
+Filling and packing
 ---
 
     tartwm fill [-w ID] [-w] [-h]
 
 Makes the active (or specified) window fill the available space vertically (`-h`) or
-horizontally (`-w`). If the window happens to be overlapping with another window, this
-will remove the overlaps by resizing the window.
+horizontally (`-w`). This command also removes overlaps
 
-    tartwm fillall
+    tartwm pack 
 
-Will make all the windows occupy as much space as possible without overlapping. Try
+Will make all visible windows occupy as much space as possible without overlapping. Try
 using it after shrinking a window or if you forgot to resize using `-c`.
+Anchored windows will be ignored.
+
+    tartwm grid
+
+Give all visible windows equal size and width and arrange them in a grid. 
+
 
 
 Focusing
@@ -108,10 +113,11 @@ With `-p` focuses the previous window.
 Find
 ---
 
-    tartwm find string
+    tartwm find [-p x y] [string]
 
 Searches for substring `string` in windows' titles and classes, returning the ID of
-the most likely match.
+the most likely match. With flag `-p`, reports the ID of the window at coordinates
+`x, y`.
 
 
 Close
@@ -127,6 +133,7 @@ Tagging
 
 Windows are assigned to tags, which can then be used to show/hide groups of windows.
 Windows can only belong to one tag, but multiple tags can be shown on screen at once.
+When resizing and moving, windows will only interact with other windows on their tag.
 By default, newly spawned windows are assigned to the first tag.
 
     tartwm tag [-w ID] name
@@ -136,3 +143,24 @@ Assign the active (or specified) window to tag `name`.
     tartwm toggle tag
 
 Shows or hides all the windows assigned to `tag`.
+
+
+Listing information
+---
+
+    tartwm ls [-w ID]
+
+Returns the title, tag and properties of all windows or with `-w` the specified
+window. 
+
+
+Saving and restoring layouts
+---
+
+    tartwm save
+
+Saves the geometry of all windows (visible and hidden).
+
+    tartwm restore
+
+Restores the saved geometry.
