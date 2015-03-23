@@ -9,7 +9,7 @@ Usage
 
 Start TartWM with this at the end of your .xinitrc
 
-    exec tartwm <path/to/config
+    exec tartwm -c path/to/config
 
 
 Configuration
