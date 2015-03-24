@@ -5,9 +5,8 @@
 #include <error.h>  // For error_t
 #include <fcntl.h>  // For open() flags O_*
 #include <signal.h> // For catching SIGINT, SIGTERM
-#include <unistd.h> // For size_t, access()
+#include <unistd.h> // For getopt()
 #include <string.h> // For strtok
-#include <argp.h>   // For better argument parsing
 #include <stdbool.h> // For booleans
 #include <stdint.h>  // For clearer integer types
 #include <stdlib.h>  // For getenv, atoi, etc.
@@ -15,16 +14,13 @@
 #include <sys/stat.h>  // For file mode constants S_*
 #include <xcb/xcb.h>
 
+#include "args.h"
+
+#define BUFSIZE 255
+#define MAXSPLIT 32
+
 
 // -- Handy structs
-struct arguments
-{
-  char * command;
-  char ** command_args;
-  char * config_file;
-  bool is_host;
-};
-
 struct config 
 {
   uint16_t x, y, g, t, b, l, r, bw;
@@ -40,61 +36,14 @@ struct rectangle {
 // -- Prototypes
 void handle_sig (int32_t signal);
 void parse_config (struct config * cfg, char * path);
-uint8_t split_line (char * line, const char * delim, char ** tokens);
+size_t split_line (char * line, const char * delim, char * tokens[], size_t tok_size);
+void join_line(char * tokens[], size_t ntok, char * buf, size_t buf_size, const char * delim);
 bool assign_uint16 (const char * match, char * key, char * val, uint16_t * dest);
 bool assign_uint32 (const char * match, char * key, char * val, uint32_t * dest);
 
 
-// -- Used for SIGINT and SIGTERM cleanup
-bool run;
-
-
-// -- Argument processing
-const char * argp_program_version = "1";
-const char * argp_program_bug_address = "<vixus0@lilhom.co.uk>";
-static char doc[] = "TartWM -- A tasty grid-based, floating window manager.";
-static char args_doc[] = "[command [command arguments]]";
-static struct argp_option options[] = {
-  { "config", 'c', "file", 0, "Configuration file" },
-  { 0 }
-  };
-
-static error_t 
-parse_opt (int key, char * arg, struct argp_state * state)
-{
-  struct arguments * args = state->input;
-
-  switch (key)
-  {
-    case 'c':
-      args->config_file = arg;
-      printf("args->config_file: %s\n", arg);
-      break;
-
-    case ARGP_KEY_NO_ARGS:
-      // No commands means we're a host
-      args->is_host = true;
-      printf("args->is_host: true\n");
-      break;
-
-    case ARGP_KEY_ARG:
-      // We're a client sending a command
-      args->command = arg;
-      // Put all remaining args in commands
-      args->command_args = &state->argv[state->next];
-      // Don't process any more args
-      state->next = state->argc;
-      printf("args->command: %s\n", arg);
-      break;
-
-    default:
-      return ARGP_ERR_UNKNOWN;
-  }
-
-  return 0;
-}
-
-static struct argp argp = { options, parse_opt, args_doc, doc };
+// -- Some vars
+static bool run;
 
 
 // -- Implementations
@@ -109,13 +58,11 @@ main (int32_t argc, char * argv[])
     exit(EXIT_FAILURE);
   }
 
-  char fifo_path[128];
+  struct main_args args = { .is_host = false, .config_file = NULL };
+  parse_main_args(argc, argv, &args);
 
-  snprintf(fifo_path, 128, "/tmp/tartwm-%s.fifo", &display[1]);
-
-  struct arguments args = { .is_host = false, .config_file = NULL };
-
-  argp_parse(&argp, argc, argv, 0, 0, &args);
+  char fifo_path[BUFSIZE];
+  snprintf(fifo_path, BUFSIZE, "/tmp/tartwm-%s.fifo", &display[1]);
 
   if ( args.is_host )
   {
@@ -155,14 +102,14 @@ main (int32_t argc, char * argv[])
     signal(SIGINT, handle_sig);
     signal(SIGTERM, handle_sig);
 
-    char buf[256];
+    char buf[BUFSIZE];
 
     printf("Running.\n");
     run = true;
 
     while ( run ) 
     {
-      if ( fgets(buf, sizeof(buf), fifo_read) != NULL ) 
+      if ( fgets(buf, BUFSIZE, fifo_read) != NULL ) 
         printf("read: %s\n", buf);
       fflush(stdout);
     }
@@ -175,8 +122,15 @@ main (int32_t argc, char * argv[])
   else
   {
     // We are a client
-    printf("Opening FIFO for writing.\n");
-    FILE * fifo_write = fopen(fifo_path, "w");
+    int32_t fifo_fd;
+
+    if ( (fifo_fd = open(fifo_path, O_NONBLOCK | O_WRONLY)) == -1 )
+    {
+      fputs("Is TartWM running?\n", stderr);
+      exit(EXIT_FAILURE);
+    }
+
+    FILE * fifo_write = fdopen(fifo_fd, "w");
 
     if ( fifo_write == NULL )
     {
@@ -184,8 +138,20 @@ main (int32_t argc, char * argv[])
       exit(EXIT_FAILURE);
     }
 
-    printf("Writing to fifo: %s\n", args.command);
-    fputs(args.command, fifo_write); 
+    if ( args.ncommand == 1 )
+    {
+      fputs(args.command[0], fifo_write); 
+    }
+    else
+    {
+      size_t i;
+      for ( i=0; i<args.ncommand; i++ )
+      {
+        fputs(args.command[i], fifo_write);
+        fputs(" ", fifo_write);
+      }
+    }
+
     fclose(fifo_write);
   }
 
@@ -211,27 +177,27 @@ parse_config (struct config * c, char * path)
     return;
   }
 
-  char buf[256];
-  char * pos[32];
-  uint8_t ntok;
+  char buf[BUFSIZE];
+  char * tok[MAXSPLIT];
+  size_t ntok;
 
-  while ( fgets(buf, sizeof(buf), config_file) != NULL )
+  while ( fgets(buf, BUFSIZE, config_file) != NULL )
   {
-    ntok = split_line(buf, " \t", pos);
+    ntok = split_line(buf, " \t", tok, MAXSPLIT);
 
     if ( ntok > 1 )
     {
-      if ( assign_uint16("x", pos[0], pos[1], &c->x) );
-      else if ( assign_uint16("y", pos[0], pos[1], &c->y) ); 
-      else if ( assign_uint16("gap", pos[0], pos[1], &c->g) ); 
-      else if ( assign_uint16("top", pos[0], pos[1], &c->t) ); 
-      else if ( assign_uint16("bottom", pos[0], pos[1], &c->b) ); 
-      else if ( assign_uint16("left", pos[0], pos[1], &c->l) ); 
-      else if ( assign_uint16("right", pos[0], pos[1], &c->r) ); 
-      else if ( assign_uint16("bw", pos[0], pos[1], &c->bw) ); 
-      else if ( assign_uint32("cf", pos[0], pos[1], &c->cf) ); 
-      else if ( assign_uint32("cu", pos[0], pos[1], &c->cu) ); 
-      else if ( assign_uint32("ci", pos[0], pos[1], &c->ci) ); 
+      if ( assign_uint16("x", tok[0], tok[1], &c->x) );
+      else if ( assign_uint16("y", tok[0], tok[1], &c->y) ); 
+      else if ( assign_uint16("gap", tok[0], tok[1], &c->g) ); 
+      else if ( assign_uint16("top", tok[0], tok[1], &c->t) ); 
+      else if ( assign_uint16("bottom", tok[0], tok[1], &c->b) ); 
+      else if ( assign_uint16("left", tok[0], tok[1], &c->l) ); 
+      else if ( assign_uint16("right", tok[0], tok[1], &c->r) ); 
+      else if ( assign_uint16("bw", tok[0], tok[1], &c->bw) ); 
+      else if ( assign_uint32("cf", tok[0], tok[1], &c->cf) ); 
+      else if ( assign_uint32("cu", tok[0], tok[1], &c->cu) ); 
+      else if ( assign_uint32("ci", tok[0], tok[1], &c->ci) ); 
     }
   }
 
@@ -239,23 +205,22 @@ parse_config (struct config * c, char * path)
 }
 
 
-uint8_t
-split_line (char * line, const char * delim, char * pos[])
+size_t
+split_line (char * line, const char * delim, char * tokens[], size_t tok_size)
 {
   // Get rid of any newline
-  char * npos;
+  char * ntok;
 
-  if ( (npos = strchr(line, '\n')) != NULL )
-    *npos = '\0';
+  if ( (ntok = strchr(line, '\n')) != NULL )
+    *ntok = '\0';
 
   size_t count = 0;
-  size_t pos_size = sizeof(pos);
   char * tok = strtok(line, delim);
 
   while ( tok != NULL ) 
   {
-    if ( count < pos_size )
-      pos[count] = tok;
+    if ( count < tok_size )
+      tokens[count] = tok;
     else
       break;
 
@@ -264,6 +229,24 @@ split_line (char * line, const char * delim, char * pos[])
   }
 
   return count;
+}
+
+
+void
+join_line ( char * tokens[], size_t ntok, char * buf, size_t buf_size, const char * delim)
+{
+  size_t t=0, len=0, dlen=strlen(delim);
+  char * str = buf;
+
+  printf("Join line\n");
+
+  while ( (dlen<buf_size) && (len<buf_size) && (t<ntok) )
+  {
+    str = strncat(str, tokens[t], buf_size);
+    str = strncat(str, delim, dlen);
+    len += strlen(tokens[t]) + dlen; 
+    t++;
+  }
 }
 
 
