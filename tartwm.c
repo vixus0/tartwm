@@ -2,7 +2,7 @@
 // tartwm.c
 //
 
-#include <error.h>  // For error_t
+#include <errno.h>
 #include <fcntl.h>  // For open() flags O_*
 #include <signal.h> // For catching SIGINT, SIGTERM
 #include <unistd.h> // For getopt()
@@ -12,44 +12,26 @@
 #include <stdlib.h>  // For getenv, atoi, etc.
 #include <stdio.h>
 #include <sys/stat.h>  // For file mode constants S_*
+#include <xcb/xproto.h>
 #include <xcb/xcb.h>
 
-#include "args.h"
+#include "tartwm.h"
 
 #define BUFSIZE 255
 #define MAXSPLIT 32
 
+#define NORTH (1 << 0)
+#define SOUTH (1 << 1)
+#define EAST (1 << 2)
+#define WEST (1 << 3)
 
-// -- Handy structs
-struct config 
-{
-  uint16_t x, y, g, t, b, l, r, bw;
-  uint32_t cf, cu, ci;
-};
-
-struct rectangle {
-  uint16_t x, y, w, h;
-};
-
-
-
-// -- Prototypes
-void handle_sig (int32_t signal);
-void parse_config (struct config * cfg, char * path);
-size_t split_line (char * line, const char * delim, char * tokens[], size_t tok_size);
-void join_line(char * tokens[], size_t ntok, char * buf, size_t buf_size, const char * delim);
-bool assign_uint16 (const char * match, char * key, char * val, uint16_t * dest);
-bool assign_uint32 (const char * match, char * key, char * val, uint32_t * dest);
-
-
-// -- Some vars
 static bool run;
 
 
-// -- Implementations
 int32_t
 main (int32_t argc, char * argv[])
 {
+  int32_t fifo_fd;
   char * display = getenv("DISPLAY");
 
   if ( display == NULL )
@@ -58,7 +40,7 @@ main (int32_t argc, char * argv[])
     exit(EXIT_FAILURE);
   }
 
-  struct main_args args = { .is_host = false, .config_file = NULL };
+  struct main_args args;
   parse_main_args(argc, argv, &args);
 
   char fifo_path[BUFSIZE];
@@ -90,7 +72,7 @@ main (int32_t argc, char * argv[])
     }
 
     printf("Opening FIFO.\n");
-    int32_t fifo_fd = open(fifo_path, O_RDONLY | O_NONBLOCK);
+    fifo_fd = open(fifo_path, O_RDONLY);
     FILE * fifo_read = fdopen(fifo_fd, "r");
 
     if ( fifo_read == NULL ) 
@@ -99,44 +81,84 @@ main (int32_t argc, char * argv[])
       exit(EXIT_FAILURE);
     }
 
+    // Fork watcher process
+    pid_t pid = fork();
+
+    signal(SIGCHLD, SIG_IGN);
     signal(SIGINT, handle_sig);
     signal(SIGTERM, handle_sig);
 
-    char buf[BUFSIZE];
+    if ( pid != 0 )
+    {
+      char buf[BUFSIZE];
 
-    printf("Running.\n");
+      printf("Running.\n");
+      run = true;
+
+      while ( run ) 
+      {
+        if ( fgets(buf, BUFSIZE, fifo_read) != NULL ) 
+          parse_subcommand(buf);
+      }
+
+      fclose(fifo_read);
+      close(fifo_fd);
+      
+      remove(fifo_path);
+    }
+    else
+    {
+      printf("Forking tartwm -w\n");
+      fclose(fifo_read);
+      close(fifo_fd);
+
+      char * args[] = { "tartwm", "-w", NULL };
+
+      if ( execv("./tartwm", args) < 0 )
+      {
+        fprintf(stderr, "Error spawning watcher: %d\n", errno);
+      }
+    }
+  }
+  else if ( args.is_watcher )
+  {
+    // We watch for X events and send them to the host
+    FILE * fifo_write;
+    char send[BUFSIZE];
+    int32_t ret = 0;
+
+    xcb_connection_t * conn = xcb_connect(NULL, NULL);
+    xcb_generic_event_t * event;
+
+    printf("Watching for X events.\n");
+
     run = true;
 
-    while ( run ) 
+    while ( run )
     {
-      if ( fgets(buf, BUFSIZE, fifo_read) != NULL ) 
-        printf("read: %s\n", buf);
-      fflush(stdout);
+      fifo_write = open_fifo_writer(fifo_path, &fifo_fd);
+
+      if (fifo_write == NULL)
+      {
+        run = false;
+      }
+      else
+      {
+        //event = xcb_wait_for_event(conn);
+        //if ( handle_event(event, send, BUFSIZE) )
+        //  ret = fputs(send, fifo_write);
+        fputs("test", fifo_write);
+        fclose(fifo_write);
+        sleep(1);
+      }
     }
 
-    fclose(fifo_read);
     close(fifo_fd);
-    
-    remove(fifo_path);
   }
   else
   {
     // We are a client
-    int32_t fifo_fd;
-
-    if ( (fifo_fd = open(fifo_path, O_NONBLOCK | O_WRONLY)) == -1 )
-    {
-      fputs("Is TartWM running?\n", stderr);
-      exit(EXIT_FAILURE);
-    }
-
-    FILE * fifo_write = fdopen(fifo_fd, "w");
-
-    if ( fifo_write == NULL )
-    {
-      fputs("Can't contact TartWM.\n", stderr);
-      exit(EXIT_FAILURE);
-    }
+    FILE * fifo_write = open_fifo_writer(fifo_path, &fifo_fd);
 
     if ( args.ncommand == 1 )
     {
@@ -153,6 +175,7 @@ main (int32_t argc, char * argv[])
     }
 
     fclose(fifo_write);
+    close(fifo_fd);
   }
 
   return EXIT_SUCCESS;
@@ -209,10 +232,10 @@ size_t
 split_line (char * line, const char * delim, char * tokens[], size_t tok_size)
 {
   // Get rid of any newline
-  char * ntok;
+  char * str;
 
-  if ( (ntok = strchr(line, '\n')) != NULL )
-    *ntok = '\0';
+  if ( (str = strchr(line, '\n')) != NULL )
+    *str = '\0';
 
   size_t count = 0;
   char * tok = strtok(line, delim);
@@ -276,3 +299,110 @@ assign_uint32 (const char * match, char * key, char * val, uint32_t * dest)
   return false;
 }
 
+
+void
+parse_main_args (int32_t argc, char * argv[], struct main_args * args)
+{
+  extern char * optarg;
+  extern int optind;
+  int32_t opt;
+
+  const char * usage = "Usage: tartwm [-c config_file] [command [args]]\n";
+
+  args->is_host = false;
+  args->is_watcher = false;
+  args->config_file = NULL;
+
+  while ( (opt = getopt(argc, argv, "+c:hw")) != -1 ) {
+    switch ( opt )
+    {
+      case 'c':
+        args->config_file = optarg;
+        break;
+
+      case 'w':
+        args->is_watcher = true;
+        break;
+
+      case 'h':
+        fputs(usage, stderr);
+        exit(EXIT_SUCCESS);
+        break;
+
+      default:
+        fputs(usage, stderr);
+        exit(EXIT_FAILURE);
+    }
+  }
+
+  if ( optind == argc )
+  {
+    // No more arguments
+    args->is_host = ! args->is_watcher;
+  }
+  else
+  {
+    args->is_watcher = false;
+    args->command = &argv[optind];
+    args->ncommand = argc - optind;
+  }
+}
+
+
+void
+parse_subcommand (char * line)
+{
+  char * tokens[MAXSPLIT];
+  char * cmd;
+
+  if ( split_line(line, " ", tokens, MAXSPLIT) > 0 )
+  { 
+    cmd = tokens[0];
+
+    if ( strcmp(cmd, "move") == 0 )
+    {
+      printf("moving here, boss\n");
+    } 
+    else if ( strcmp(cmd, "size") == 0 )
+    {
+      printf("sizing here, boss\n");
+    }
+    else
+    {
+      fprintf(stderr, "Unrecognised command: %s\n", cmd);
+    }
+  }
+}
+
+
+FILE *
+open_fifo_writer (const char * fifo_path, int32_t * fifo_fd)
+{
+  if ( (*fifo_fd = open(fifo_path, O_NONBLOCK | O_WRONLY)) == -1 )
+  {
+    fputs("Is TartWM running?\n", stderr);
+    exit(EXIT_FAILURE);
+  }
+
+  FILE * fifo_write = fdopen(*fifo_fd, "w");
+
+  if ( fifo_write == NULL )
+  {
+    fputs("Can't contact TartWM.\n", stderr);
+    exit(EXIT_FAILURE);
+  }
+
+  return fifo_write;
+}
+
+
+bool
+handle_event (xcb_generic_event_t * event, char * send, size_t send_size)
+{
+  if ( event != NULL )
+  {
+    strncpy(send, "X event received", send_size);
+    return true;
+  }
+  return false;
+}
