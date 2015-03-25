@@ -16,17 +16,16 @@ struct rectangle {
 
 struct main_args
 {
-  char ** command;
+  char ** cmd_argv;
   char * config_file;
-  bool is_host, is_watcher;
-  size_t ncommand;
+  bool is_host;
+  size_t cmd_argc;
 };
 
 
 // -- Misc
-void handle_sig (int32_t signal);
 void parse_config (struct config * cfg, char * path);
-FILE * open_fifo_writer (const char * fifo_path, int32_t * fifo_fd);
+int32_t connect_host (const char * socket_path);
 
 // -- String handling
 size_t split_line (char * line, const char * delim, char * tokens[], size_t tok_size);

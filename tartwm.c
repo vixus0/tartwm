@@ -3,7 +3,6 @@
 //
 
 #include <errno.h>
-#include <fcntl.h>  // For open() flags O_*
 #include <signal.h> // For catching SIGINT, SIGTERM
 #include <unistd.h> // For getopt()
 #include <string.h> // For strtok
@@ -11,7 +10,9 @@
 #include <stdint.h>  // For clearer integer types
 #include <stdlib.h>  // For getenv, atoi, etc.
 #include <stdio.h>
-#include <sys/stat.h>  // For file mode constants S_*
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/stat.h>
 #include <xcb/xproto.h>
 #include <xcb/xcb.h>
 
@@ -19,6 +20,7 @@
 
 #define BUFSIZE 255
 #define MAXSPLIT 32
+#define MAXCLIENTS 5
 
 #define NORTH (1 << 0)
 #define SOUTH (1 << 1)
@@ -26,13 +28,23 @@
 #define WEST (1 << 3)
 
 static bool run;
+static struct config cfg = {
+  .x = 6, .y = 5, .g = 8, .t = 0, .b = 0, .l = 0, .r = 0, .bw = 2,
+  .cf = 0xff00ccff,
+  .cu = 0xff808080,
+  .ci = 0xffcc0000
+  };
 
 
 int32_t
 main (int32_t argc, char * argv[])
 {
-  int32_t fifo_fd;
   char * display = getenv("DISPLAY");
+  char * rundir = getenv("XDG_RUNTIME_DIR");
+  char socket_path[BUFSIZE];
+  struct main_args args;
+
+  parse_main_args(argc, argv, &args);
 
   if ( display == NULL )
   {
@@ -40,152 +52,182 @@ main (int32_t argc, char * argv[])
     exit(EXIT_FAILURE);
   }
 
-  struct main_args args;
-  parse_main_args(argc, argv, &args);
+  if ( rundir != NULL )
+  {
+    char rundir_root[BUFSIZE];
 
-  char fifo_path[BUFSIZE];
-  snprintf(fifo_path, BUFSIZE, "/tmp/tartwm-%s.fifo", &display[1]);
+    snprintf(rundir_root, BUFSIZE, "%s/tartwm", rundir);
+
+    if ( mkdir(rundir_root, S_IRWXU) == 0 )
+      snprintf(socket_path, BUFSIZE, "%s/display-%s.sock", rundir_root, &display[1]);
+    else
+      rundir = NULL;
+  }
+
+  if ( rundir == NULL )
+  {
+    snprintf(socket_path, BUFSIZE, "/tmp/tartwm-%s.sock", &display[1]);
+  }
 
   if ( args.is_host )
-  {
-    // Default config
-    struct config cfg = {
-      .x = 6, .y = 5, .g = 8, .t = 0, .b = 0, .l = 0, .r = 0, .bw = 2,
-      .cf = 0xff00ccff,
-      .cu = 0xff808080,
-      .ci = 0xffcc0000
-      };
+  { /* Host */
+    int32_t slisten, sclient;
+    uint32_t len, t;
+    struct sockaddr_un local, remote;
+
+    local.sun_family = AF_UNIX;
 
     if ( args.config_file != NULL )
     {
-      printf("Parsing config: %s\n", args.config_file);
       parse_config(&cfg, args.config_file);
     }
 
-    // We are the host
-    printf("Creating FIFO: %s\n", fifo_path);
-
-    if ( mkfifo(fifo_path, S_IRWXU | S_IRWXG) < 0 ) 
+    if ( (slisten = socket(AF_UNIX, SOCK_STREAM, 0)) == -1 )
     {
-      fputs("Failed to create FIFO.\n", stderr);
+      fputs("Failed to create socket.\n", stderr);
+      perror("socket");
+      exit(EXIT_FAILURE);
+    }
+    
+    strncpy(local.sun_path, socket_path, sizeof(local.sun_path));
+    unlink(local.sun_path);
+    len = SUN_LEN(&local);
+
+    if ( bind(slisten, (struct sockaddr *)&local, len) == -1 )
+    {
+      fputs("Failed to bind socket.\n", stderr);
+      perror("bind");
       exit(EXIT_FAILURE);
     }
 
-    printf("Opening FIFO.\n");
-    fifo_fd = open(fifo_path, O_RDONLY);
-    FILE * fifo_read = fdopen(fifo_fd, "r");
-
-    if ( fifo_read == NULL ) 
+    if ( listen(slisten, MAXCLIENTS) == -1 )
     {
-      fputs("Failed to open FIFO for reading.\n", stderr);
+      fputs("Failed to listen.\n", stderr);
+      perror("listen");
       exit(EXIT_FAILURE);
     }
 
-    // Fork watcher process
-    pid_t pid = fork();
+    if ( fork() != 0 )
+    { /* Parent */
+      char buf[BUFSIZE] = "";
+      bool done;
 
-    signal(SIGCHLD, SIG_IGN);
-    signal(SIGINT, handle_sig);
-    signal(SIGTERM, handle_sig);
-
-    if ( pid != 0 )
-    {
-      char buf[BUFSIZE];
-
-      printf("Running.\n");
       run = true;
 
       while ( run ) 
       {
-        if ( fgets(buf, BUFSIZE, fifo_read) != NULL ) 
-          parse_subcommand(buf);
+        t = sizeof(remote);
+
+        if ( (sclient = accept(slisten, (struct sockaddr *)&remote, &t)) == -1 )
+        {
+          fputs("Failed to accept connection.\n", stderr);
+          perror("accept");
+          exit(EXIT_FAILURE);
+        }
+
+        done = false;
+
+        do {
+          switch ( recv(sclient, buf, BUFSIZE, 0) )
+          {
+            case 0:
+              done = true;
+              break;
+            case -1:
+              perror("recv");
+              done = true;
+              break;
+            default:
+              printf("recv: %s\n", buf);
+              break;
+          }
+        }
+        while (!done);
+
+        close(sclient);
       }
 
-      fclose(fifo_read);
-      close(fifo_fd);
-      
-      remove(fifo_path);
+      close(slisten);
     }
     else
-    {
-      printf("Forking tartwm -w\n");
-      fclose(fifo_read);
-      close(fifo_fd);
+    { /* Child */
+      char buf[BUFSIZE] = "test";
+      int32_t s;
+      //xcb_connection_t * conn = xcb_connect(NULL, NULL);
+      //xcb_generic_event_t * event;
+      
+      close(slisten);
 
-      char * args[] = { "tartwm", "-w", NULL };
+      s = connect_host(socket_path);
 
-      if ( execv("./tartwm", args) < 0 )
+      run = true;
+
+      while ( run )
       {
-        fprintf(stderr, "Error spawning watcher: %d\n", errno);
-      }
-    }
-  }
-  else if ( args.is_watcher )
-  {
-    // We watch for X events and send them to the host
-    FILE * fifo_write;
-    char send[BUFSIZE];
-    int32_t ret = 0;
+        printf("Sending test message.\n");
 
-    xcb_connection_t * conn = xcb_connect(NULL, NULL);
-    xcb_generic_event_t * event;
+        if ( send(s, buf, BUFSIZE, 0) == -1 )
+        {
+          fputs("Couldn't send to TartWM.\n", stderr);
+          perror("send");
+          exit(EXIT_FAILURE);
+        }
 
-    printf("Watching for X events.\n");
-
-    run = true;
-
-    while ( run )
-    {
-      fifo_write = open_fifo_writer(fifo_path, &fifo_fd);
-
-      if (fifo_write == NULL)
-      {
-        run = false;
-      }
-      else
-      {
-        //event = xcb_wait_for_event(conn);
-        //if ( handle_event(event, send, BUFSIZE) )
-        //  ret = fputs(send, fifo_write);
-        fputs("test", fifo_write);
-        fclose(fifo_write);
         sleep(1);
       }
-    }
 
-    close(fifo_fd);
+      close(s);
+    }
   }
   else
-  {
-    // We are a client
-    FILE * fifo_write = open_fifo_writer(fifo_path, &fifo_fd);
+  { /* Client */
+    char buf[BUFSIZE] = "";
+    int32_t s; 
 
-    if ( args.ncommand == 1 )
+    s = connect_host(socket_path);
+
+    join_line(args.cmd_argv, args.cmd_argc, buf, BUFSIZE, " ");
+
+    if ( send(s, buf, BUFSIZE, 0) == -1 )
     {
-      fputs(args.command[0], fifo_write); 
-    }
-    else
-    {
-      size_t i;
-      for ( i=0; i<args.ncommand; i++ )
-      {
-        fputs(args.command[i], fifo_write);
-        fputs(" ", fifo_write);
-      }
+      fputs("Couldn't send to TartWM.\n", stderr);
+      perror("send");
+      exit(EXIT_FAILURE);
     }
 
-    fclose(fifo_write);
-    close(fifo_fd);
+    close(s);
   }
 
   return EXIT_SUCCESS;
 }
 
 
-void 
-handle_sig (int32_t sig)
+int32_t
+connect_host (const char * socket_path)
 {
-  run = false;
+  int32_t s;
+  uint32_t len;
+  struct sockaddr_un remote;
+
+  if ( (s = socket(AF_UNIX, SOCK_STREAM, 0)) == -1 )
+  {
+    fputs("Error creating socket.\n", stderr);
+    perror("socket");
+    exit(EXIT_FAILURE);
+  }
+
+  remote.sun_family = AF_UNIX;
+  strncpy(remote.sun_path, socket_path, sizeof(remote.sun_path));
+  len = SUN_LEN(&remote);
+
+  if ( connect(s, (struct sockaddr *)&remote, len) == -1 )
+  {
+    fputs("Error connecting to TartWM.\n", stderr);
+    perror("connect");
+    exit(EXIT_FAILURE);
+  }
+
+  return s;
 }
 
 
@@ -200,7 +242,7 @@ parse_config (struct config * c, char * path)
     return;
   }
 
-  char buf[BUFSIZE];
+  char buf[BUFSIZE] = "";
   char * tok[MAXSPLIT];
   size_t ntok;
 
@@ -232,13 +274,13 @@ size_t
 split_line (char * line, const char * delim, char * tokens[], size_t tok_size)
 {
   // Get rid of any newline
-  char * str;
-
-  if ( (str = strchr(line, '\n')) != NULL )
-    *str = '\0';
-
   size_t count = 0;
-  char * tok = strtok(line, delim);
+  char * tok;
+
+  if ( (tok = strchr(line, '\n')) != NULL )
+    *tok = '\0';
+
+  tok = strtok(line, delim); 
 
   while ( tok != NULL ) 
   {
@@ -260,8 +302,6 @@ join_line ( char * tokens[], size_t ntok, char * buf, size_t buf_size, const cha
 {
   size_t t=0, len=0, dlen=strlen(delim);
   char * str = buf;
-
-  printf("Join line\n");
 
   while ( (dlen<buf_size) && (len<buf_size) && (t<ntok) )
   {
@@ -310,18 +350,13 @@ parse_main_args (int32_t argc, char * argv[], struct main_args * args)
   const char * usage = "Usage: tartwm [-c config_file] [command [args]]\n";
 
   args->is_host = false;
-  args->is_watcher = false;
   args->config_file = NULL;
 
-  while ( (opt = getopt(argc, argv, "+c:hw")) != -1 ) {
+  while ( (opt = getopt(argc, argv, "+c:h")) != -1 ) {
     switch ( opt )
     {
       case 'c':
         args->config_file = optarg;
-        break;
-
-      case 'w':
-        args->is_watcher = true;
         break;
 
       case 'h':
@@ -338,13 +373,12 @@ parse_main_args (int32_t argc, char * argv[], struct main_args * args)
   if ( optind == argc )
   {
     // No more arguments
-    args->is_host = ! args->is_watcher;
+    args->is_host = true;
   }
   else
   {
-    args->is_watcher = false;
-    args->command = &argv[optind];
-    args->ncommand = argc - optind;
+    args->cmd_argv = &argv[optind];
+    args->cmd_argc = argc - optind;
   }
 }
 
@@ -375,34 +409,8 @@ parse_subcommand (char * line)
 }
 
 
-FILE *
-open_fifo_writer (const char * fifo_path, int32_t * fifo_fd)
-{
-  if ( (*fifo_fd = open(fifo_path, O_NONBLOCK | O_WRONLY)) == -1 )
-  {
-    fputs("Is TartWM running?\n", stderr);
-    exit(EXIT_FAILURE);
-  }
-
-  FILE * fifo_write = fdopen(*fifo_fd, "w");
-
-  if ( fifo_write == NULL )
-  {
-    fputs("Can't contact TartWM.\n", stderr);
-    exit(EXIT_FAILURE);
-  }
-
-  return fifo_write;
-}
-
-
 bool
 handle_event (xcb_generic_event_t * event, char * send, size_t send_size)
 {
-  if ( event != NULL )
-  {
-    strncpy(send, "X event received", send_size);
-    return true;
-  }
   return false;
 }
