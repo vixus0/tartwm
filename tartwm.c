@@ -42,6 +42,8 @@ main (int32_t argc, char * argv[])
   char * display = getenv("DISPLAY");
   char * rundir = getenv("XDG_RUNTIME_DIR");
   char socket_path[BUFSIZE];
+  xcb_connection_t * conn;
+  xcb_screen_t * screen;
   struct main_args args;
 
   parse_main_args(argc, argv, &args);
@@ -69,6 +71,8 @@ main (int32_t argc, char * argv[])
     snprintf(socket_path, BUFSIZE, "/tmp/tartwm-%s.sock", &display[1]);
   }
 
+  init_xcb(&conn, &screen);
+  
   if ( args.is_host )
   { /* Host */
     int32_t slisten, sclient;
@@ -151,20 +155,57 @@ main (int32_t argc, char * argv[])
     }
     else
     { /* Child */
-      char buf[BUFSIZE] = "test";
+      char buf[BUFSIZE] = "";
       int32_t s;
-      //xcb_connection_t * conn = xcb_connect(NULL, NULL);
-      //xcb_generic_event_t * event;
-      
+      uint32_t win_events, nw, i;
+      xcb_generic_event_t * event;
+      xcb_create_notify_event_t * ec;
+      xcb_window_t * wc;
+
       close(slisten);
 
       s = connect_host(socket_path);
 
-      run = true;
+      /* Register to receive all events on root window. */
+      register_events(conn, screen->root, XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY);
 
-      while ( run )
+      xcb_grab_button(conn, 1, screen->root,
+          XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE,
+          XCB_GRAB_MODE_ASYNC, XCB_GRAB_MODE_ASYNC, screen->root, XCB_NONE,
+          XCB_BUTTON_INDEX_ANY, XCB_NONE);
+
+      /* Register events on all mapped windows. */
+      win_events = XCB_EVENT_MASK_NO_EVENT
+        | XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE
+        | XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE
+        | XCB_EVENT_MASK_ENTER_WINDOW
+        ;
+
+      nw = win_children(conn, screen->root, &wc);
+
+      for ( i=0; i<nw; i++ )
+        register_events(conn, wc[i], win_events);
+
+      /* Begin watching */
+      while ( (event = xcb_wait_for_event(conn)) != NULL )
       {
-        printf("Sending test message.\n");
+
+        switch ( event->response_type & ~0x80 & win_events )
+        {
+          /* New windows need to register events. */
+          case XCB_CREATE_NOTIFY:
+            ec = (xcb_create_notify_event_t *)event;
+            register_events(conn, ec->window, win_events);
+            strncpy(buf, "xcb: window created", BUFSIZE);
+            break;
+
+          case XCB_ENTER_NOTIFY:
+            strncpy(buf, "xcb: entered window", BUFSIZE);
+            break;
+
+          default:
+            strncpy(buf, "xcb: some event", BUFSIZE);
+        }
 
         if ( send(s, buf, BUFSIZE, 0) == -1 )
         {
@@ -172,8 +213,6 @@ main (int32_t argc, char * argv[])
           perror("send");
           exit(EXIT_FAILURE);
         }
-
-        sleep(1);
       }
 
       close(s);
@@ -413,4 +452,57 @@ bool
 handle_event (xcb_generic_event_t * event, char * send, size_t send_size)
 {
   return false;
+}
+
+
+void
+init_xcb (xcb_connection_t ** c, xcb_screen_t ** s)
+{
+  *c = xcb_connect(NULL, NULL);
+
+  if ( xcb_connection_has_error(*c) )
+  {
+    fputs("Can't connect to X server.\n", stderr);
+    exit(EXIT_FAILURE);
+  }
+
+  *s = xcb_setup_roots_iterator(xcb_get_setup(*c)).data;
+
+  if ( *s == NULL )
+  {
+    fputs("Can't get default screen.\n", stderr);
+    exit(EXIT_FAILURE);
+  }
+}
+
+
+void
+register_events (xcb_connection_t * c, xcb_window_t win, uint32_t mask)
+{
+  uint32_t val[] = { mask };
+  
+  xcb_change_window_attributes(c, win, XCB_CW_EVENT_MASK, val);
+  xcb_flush(c);
+}
+
+
+uint32_t
+win_children (xcb_connection_t * c, xcb_window_t win, xcb_window_t * children[])
+{
+  int nchild = 0;
+
+  xcb_query_tree_cookie_t cookie;
+  xcb_query_tree_reply_t * reply;
+
+  cookie = xcb_query_tree(c, win);
+  reply = xcb_query_tree_reply(c, cookie, NULL);
+
+  if ( reply != NULL )
+  {
+    *children = xcb_query_tree_children(reply);
+    nchild = reply->children_len;
+    free(reply);
+  }
+
+  return nchild;
 }

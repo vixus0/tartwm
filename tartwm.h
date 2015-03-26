@@ -39,3 +39,8 @@ void parse_subcommand (char * line);
 
 // -- Events
 bool handle_event (xcb_generic_event_t * event, char * send, size_t send_size);
+
+// -- XCB
+void init_xcb (xcb_connection_t ** c, xcb_screen_t ** s);
+void register_events (xcb_connection_t * c, xcb_window_t win, uint32_t mask);
+uint32_t win_children (xcb_connection_t * c, xcb_window_t win, xcb_window_t * children[]);
