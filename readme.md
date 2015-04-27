@@ -1,7 +1,15 @@
 TartWM
 ===
 
-A grid-based floating window manager with collision detection and tags.
+A grid-based floating window utility with collision detection and tags.
+
+After enjoying the pleasures of other, more full-featured window managers for
+some time (eg. openbox), I've realised it would be more useful to have tartwm
+able to run alongside such a window manager. The more powerful WM can then
+handle pesky things like mouse focus and window decoration.
+
+To this end, TartWM can be considered a simple but powerful tool for window 
+arrangement. TartWM is not a static/dynamic tiler in the traditional sense.
 
 
 Usage
@@ -21,17 +29,10 @@ TartWM will read a config file from stdin. Here's an example:
     y 6 
     gap 8
     top 16
-    bw 2
-    bf 00ccff
-    bu 808080
-    bi ac4142
 
 This will create a 5×6 grid with 8px gaps and 16px of padding at the top edge of the
 screen. The `y` option can be omitted for a 5×5 grid. There are `bottom`, `left` and
 `right` options for the other screen edges.
-
-`bw` sets the border width while `bf` and `bu` set the focused and unfocused border
-colors, respectively. `bi` is the colour for windows marked urgent.
 
 
 Control
@@ -41,60 +42,79 @@ TartWM is controlled entirely from the commandline and doesn't have any support 
 key or mouse binding. You should really use something like sxhkd. 
 
 
-Movement
+Grid Conventions
 ---
 
-    tartwm move [-w ID] [-sp] x y
+TartWM does *everything* on a grid. Arguments to commands involving sizing and
+movement (written as `GRID` below) are given in the following format:
 
-Moves the window by `x` and `y` (± in grid units).
-If the `-s` flag is specified collision detection will be applied and the window 
-will shove other windows along with it. The `-p` flag assumes `x` and `y` are
-absolute pointer coordinates, and will move the center of the window to that precise
-location. TartWM will automatically constrain this to the grid. 
+    [±]X [[±]Y]
+
+Prepending each argument with `+` or `-` makes it a relative value, while
+omitting these make it absolute. Cell indexing starts at 1. Supplying a value
+of 0 for X or Y will leave that coordinate unchanged.
+ 
+
+Move
+---
+
+    tartwm move [-w ID] [-e] GRID
+
+Moves the focused or specified window. If the window is blocked by another in
+the direction it's trying to go, the offending window is shoved along with it.
+Supplying the `-e` flag means the window will keep going until it hits something
+(eg. another window or the screen edge.)
 
 Examples:
 
-    tartwm move 2 0
+    tartwm move +2
 
 will move the active window 2 grid cells to the right.
 
-    tartwm move -s 0 -1
+    tartwm move 1 1
 
-will move the active window 1 grid cell up, shoving any other windows with it.
+will move the window to the top left cell. If something is already in the cell,
+the window won't move.
+
+    tartwm move -e 0 -1
+
+will move the window upwards until it hits something. Repeating the call and
+omitting the `-e` flag will shove the blocking window (if possible) along.
 
 
-Resizing
+Resize
 ---
 
-    tartwm size [-w ID] [-e edge] [-scpf] x
+    tartwm size [-w ID] [-e] [-d EDGE] GRID
 
-Resizes `edge` (defaults to `NESW`) by `x` (± in grid coordinates). If `-f` is specified
-then the edge grows until it hits another window. The `-s` flag will shove other windows 
-as the window resizes and the `-c` flag crushes other windows, ie. they will shrink in response.
-You can't use `-c` with `-f`.
+Basically works the same way as moving the window. `EDGE` should be one (or more)
+of `NSEW`. Supplying the `-e` flag will grow the window until it hits something. 
+Absolute values will attempt to set the window to that size, or at least the 
+maximum available size.
 
 Examples:
 
-    tartwm size -e N -sc 5
+    tartwm size -e -d W +1
 
-Grows the top edge by 5 grid units, shoving and crushing other windows.
+will grow the left edge of the window until it hits something.
 
-    tartwm size -e SE -3
+    tartwm size -d NE -1
 
-Shrinks the bottom and right edges by 3 grid units.
+will shrink the top and right edges of the window. 
 
-    tartwm size -e NS -sf
+    tartwm size 3 3
 
-Makes the window vertically fill the available space, shoving other windows.
+will attempt to set the window size to 3 cells wide and 3 cells tall. Only
+unhindered edges can grow.
+    
 
-
-Anchoring
+Anchor
 ---
 
     tartwm anchor [-w ID]
 
-Toggles anchoring of the active (or specified) window. Anchored windows can't be shoved
-or crushed by other windows.
+Toggles anchoring of the active (or specified) window. Anchored windows can't be
+shoved or moved.
 
 
 Arrange
@@ -104,15 +124,14 @@ Arrange
 
 Will make all visible windows occupy as much space as possible without overlapping. Try
 using it after shrinking a window or if you forgot to resize using `-c`.
-Anchored windows will be ignored.
 
     tartwm grid
 
-Give all visible windows equal size and width and arrange them in a grid. 
+Give all visible windows equal size and width and arrange them in the grid.
+Anchored windows will be ignored.
 
 
-
-Focusing
+Focus
 ---
 
     tartwm focus [-w ID] [-udlrp]
@@ -129,7 +148,8 @@ Find
 
 Searches for substring `string` in windows' titles and classes, returning the ID of
 the most likely match. With flag `-p`, reports the ID of the window at coordinates
-`x,y`. You can't use both `-p` and `-s`.
+`x,y`. If both `-p` and `-s` are supplied, the substring acts as a filter, only
+returning windows at `x,y` that contain `string`.
 
 
 Close
@@ -140,7 +160,7 @@ Close
 Closes the active (or specified) window, sending `WM_DELETE`.
 
 
-Tagging
+Tag
 ---
 
 Windows are assigned to tags, which can then be used to show/hide groups of windows.
@@ -161,7 +181,7 @@ Shows or hides all the windows assigned to `tag`.
 Will exclusively show windows assigned to `tag` and hide all others.
 
 
-Listing information
+List Window Information
 ---
 
     tartwm ls [-w ID]
@@ -170,13 +190,14 @@ Returns the title, tag and properties of all windows or with `-w` the specified
 window. 
 
 
-Saving and restoring layouts
+Save and Restore Layouts
 ---
 
-    tartwm save
+    tartwm save [-f file]
 
-Saves the geometry of all windows (visible and hidden).
+Saves the geometry of all windows (visible and hidden). If `-f` is supplied the
+layout is saved to a file, otherwise it's just kept in memory.
 
-    tartwm restore
+    tartwm restore [-f file]
 
-Restores the saved geometry.
+Restores the saved geometry from memory or the supplied file.
